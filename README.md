@@ -4,6 +4,8 @@ QQ 官方机器人网关 ↔ Claude Code CLI 的桥接器。
 
 一个 QQ 号挂多个机器人，本桥接器独立占用一个机器人通道（AppID: 你的AppID），通过 WebSocket 直连腾讯官方网关，把 QQ 消息转发给 Claude Code，再把 Claude Code 的回复发回 QQ。
 
+![Claude QQ Bridge Demo](images/demo.jpg)
+
 ## 架构
 
 ```
