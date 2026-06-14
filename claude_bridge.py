@@ -30,7 +30,7 @@ APP_SECRET = "你的AppSecret"
 MASTER_OPENID = "你的MASTER_OPENID"
 
 # Claude Code 超时（秒）
-CLAUDE_TIMEOUT = 300
+CLAUDE_TIMEOUT = 600
 
 # API 端点
 API_BASE = "https://api.sgroup.qq.com"
@@ -41,7 +41,7 @@ GATEWAY_URL_PATH = "/gateway"
 CONNECT_TIMEOUT = 20
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 MAX_RECONNECT_ATTEMPTS = 100
-HEARTBEAT_INTERVAL = 30.0
+HEARTBEAT_INTERVAL = 15.0  # 服务端33秒超时，留足余量
 # ==========================================
 
 logging.basicConfig(
@@ -63,6 +63,8 @@ _ws = None
 _http_client = None
 _running = False
 _last_msg_id: Optional[str] = None
+_ws_session = None  # 当前活动的 aiohttp.ClientSession，用于重连时关闭旧session
+heartbeat_task = None  # 心跳任务引用
 
 
 def clean_ansi(text: str) -> str:
@@ -73,8 +75,8 @@ def clean_ansi(text: str) -> str:
 SESSION_STORE: dict[str, list] = {}
 MAX_HISTORY_LEN = 200  # 100轮对话
 
-def query_claude(user_id: str, prompt: str) -> str:
-    """调用 claude --print，带多轮会话记忆，返回清洗后的输出"""
+async def query_claude(user_id: str, prompt: str) -> str:
+    """调用 claude --print，带多轮会话记忆，返回清洗后的输出（async 版，不阻塞事件循环）"""
     
     # 初始化用户历史
     if user_id not in SESSION_STORE:
@@ -96,17 +98,23 @@ def query_claude(user_id: str, prompt: str) -> str:
     final_prompt = "\n\n".join(parts)
     
     try:
-        result = subprocess.run(
-            ["claude", "--print", "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent,TodoRead,TodoWrite", "--", final_prompt],
-            capture_output=True,
-            text=True,
-            timeout=CLAUDE_TIMEOUT,
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "--print", "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent,TodoRead,TodoWrite", "--", final_prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "HTTPS_PROXY": "", "HTTP_PROXY": ""},
         )
-        output = result.stdout.strip()
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return "[Claude timeout]"
+        
+        output = stdout.decode("utf-8", errors="replace").strip()
         if not output:
-            if result.stderr:
-                return f"[Claude error] {result.stderr.strip()[:300]}"
+            if stderr:
+                return f"[Claude error] {stderr.decode('utf-8', errors='replace').strip()[:300]}"
             return "[Claude no output]"
         
         reply = clean_ansi(output)
@@ -121,8 +129,6 @@ def query_claude(user_id: str, prompt: str) -> str:
         
         return reply
         
-    except subprocess.TimeoutExpired:
-        return "[Claude timeout]"
     except Exception as e:
         return f"[Claude error] {str(e)[:300]}"
 
@@ -241,8 +247,12 @@ async def send_message_rest(user_openid: str, content: str) -> bool:
         "User-Agent": "ClaudeBridge/2.0",
     }
     msg_seq = _next_msg_seq(user_openid)
+    # 截断时加提示
+    display_content = content
+    if len(content) > 4000:
+        display_content = content[:3990] + "\n\n... (已截断)"
     body = {
-        "markdown": {"content": content[:4000]},
+        "markdown": {"content": display_content},
         "msg_type": 2,
         "msg_seq": msg_seq,
     }
@@ -305,7 +315,7 @@ async def handle_c2c_message(d: dict):
 
     # 调用 Claude
     logger.info(f"[QQ -> Claude] {content}")
-    reply = query_claude(user_openid, content)
+    reply = await query_claude(user_openid, content)
     logger.info(f"[Claude -> QQ] {reply[:200]}")
 
     success = await send_message_rest(user_openid, reply)
@@ -333,12 +343,13 @@ async def _heartbeat_sender(ws, interval: float):
 
 async def event_loop(ws):
     """WebSocket event receive loop with reconnect"""
-    global _session_id, _last_seq, _running, _ws
+    global _session_id, _last_seq, _running, _ws, heartbeat_task
     _ws = ws
     backoff_idx = 0
     connect_time = 0.0
     quick_disconnect_count = 0
     heartbeat_interval = HEARTBEAT_INTERVAL
+    heartbeat_task = None
 
     # Start heartbeat as background task
     heartbeat_task = asyncio.create_task(_heartbeat_sender(ws, heartbeat_interval))
@@ -387,7 +398,8 @@ async def event_loop(ws):
                         elif t == "RESUMED":
                             logger.info("Session resumed")
                         elif t == "C2C_MESSAGE_CREATE":
-                            asyncio.create_task(handle_c2c_message(d))
+                            task = asyncio.create_task(handle_c2c_message(d))
+                            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
                         else:
                             logger.debug(f"Unhandled event: {t}")
                         continue
@@ -437,10 +449,13 @@ async def event_loop(ws):
             await asyncio.sleep(delay)
 
             try:
+                # P1-a: 关闭旧 ws_session 防止资源泄漏
+                if _ws_session and not _ws_session.closed:
+                    await _ws_session.close()
                 gateway_url = await get_gateway_url()
                 import aiohttp
-                ws_session = aiohttp.ClientSession(trust_env=True)
-                ws = await ws_session.ws_connect(
+                _ws_session = aiohttp.ClientSession(trust_env=True)
+                ws = await _ws_session.ws_connect(
                     gateway_url,
                     headers={"User-Agent": "ClaudeBridge/2.0"},
                     timeout=aiohttp.ClientWSTimeout(ws_close=CONNECT_TIMEOUT),
@@ -448,6 +463,14 @@ async def event_loop(ws):
                 _ws = ws
                 backoff_idx = 0
                 quick_disconnect_count = 0
+                # 取消旧心跳task，等待完成（P1-b: cancel后必须await）
+                if heartbeat_task and not heartbeat_task.done():
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                heartbeat_task = asyncio.create_task(_heartbeat_sender(ws, heartbeat_interval))
                 logger.info("Reconnected")
             except Exception as e:
                 logger.error(f"Reconnect failed: {e}")
@@ -469,7 +492,7 @@ async def event_loop(ws):
 # ================= 入口 =================
 
 async def main():
-    global _running, _http_client
+    global _running, _http_client, _ws_session
 
     print("=" * 50)
     print("  Claude Code <-> QQ Bot (Official WebSocket)")
@@ -487,8 +510,8 @@ async def main():
     gateway_url = await get_gateway_url()
     logger.info(f"Gateway URL: {gateway_url}")
 
-    ws_session = aiohttp.ClientSession(trust_env=True)
-    ws = await ws_session.ws_connect(
+    _ws_session = aiohttp.ClientSession(trust_env=True)
+    ws = await _ws_session.ws_connect(
         gateway_url,
         headers={"User-Agent": "ClaudeBridge/2.0"},
         timeout=aiohttp.ClientWSTimeout(ws_close=CONNECT_TIMEOUT),
@@ -503,10 +526,11 @@ async def main():
         _running = False
         try:
             await ws.close()
-            await ws_session.close()
+            await _ws_session.close()
         except Exception:
             pass
         await _http_client.aclose()
+        _http_client = None
         logger.info("Shutdown complete")
 
 

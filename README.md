@@ -88,6 +88,15 @@ tail -f claude_bridge.log
 
 ## 更新记录
 
+### v2.2 (2026-06-14) — 稳定性修复 + 代码审查整改
+- **P0 修复**：`subprocess.run` → `asyncio.create_subprocess_exec`，不再阻塞事件循环（解决断连根因）
+- **P1-a 修复**：重连时关闭旧 `_ws_session`，防止 ClientSession 资源泄漏
+- **P1-b 修复**：`heartbeat_task.cancel()` 后加 `await`，正确处理 CancelledError
+- **心跳间隔优化**：30s → 15s（服务端 33s 超时，留足余量防断连）
+- **Bug 修复**：`heartbeat_task` 模块顶部预定义，避免 global 引用未定义变量
+- **异常处理**：`handle_c2c_message` 的 `create_task` 加 `add_done_callback` 捕获异常
+- **代码审查**：Claude 自审报告 8 个问题，P0/P1 全部修复
+
 ### v2.1 (2026-06-14) — 权限方案重构
 - **移除** `--dangerously-skip-permissions`（root 下不可用）
 - **改用** `--allowedTools` 白名单方案，预授权 Bash/Read/Write/Edit/Glob/Grep/WebSearch/WebFetch 等工具
