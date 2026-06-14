@@ -97,7 +97,7 @@ def query_claude(user_id: str, prompt: str) -> str:
     
     try:
         result = subprocess.run(
-            ["claude", "--print", final_prompt],
+            ["claude", "--print", "--dangerously-skip-permissions", final_prompt],
             capture_output=True,
             text=True,
             timeout=CLAUDE_TIMEOUT,
