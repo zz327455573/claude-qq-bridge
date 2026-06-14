@@ -1,0 +1,11 @@
+config.yaml
+config.json
+*.log
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+.env.*
+
+# 敏感文件
+*-credentials.txt
