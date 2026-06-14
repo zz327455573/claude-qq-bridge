@@ -22,12 +22,12 @@ from typing import Optional, Dict, Any
 
 # ================= 配置区 =================
 # QQ 开放平台机器人凭证（第三个机器人：连Claude Code）
-APP_ID = "YOUR_APP_ID"  # 替换为你的 App ID
-APP_SECRET = "YOUR_APP_SECRET"  # 替换为你的 App Secret
+APP_ID = "你的AppID"
+APP_SECRET = "你的AppSecret"
 
 # 主理人标识（权限隔离用）
 # 首次运行时查看日志拿到的 openid，和 QQ 号可能不同
-MASTER_OPENID = "YOUR_MASTER_OPENID"  # 替换为你的 openid
+MASTER_OPENID = "你的MASTER_OPENID"
 
 # Claude Code 超时（秒）
 CLAUDE_TIMEOUT = 300
@@ -97,7 +97,7 @@ def query_claude(user_id: str, prompt: str) -> str:
     
     try:
         result = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", final_prompt],
+            ["claude", "--print", "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent,TodoRead,TodoWrite", "--", final_prompt],
             capture_output=True,
             text=True,
             timeout=CLAUDE_TIMEOUT,

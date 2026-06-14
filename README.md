@@ -86,6 +86,20 @@ tail -f claude_bridge.log
 - 技术问答机器人
 - 远程运维指令通道
 
+## 更新记录
+
+### v2.1 (2026-06-14) — 权限方案重构
+- **移除** `--dangerously-skip-permissions`（root 下不可用）
+- **改用** `--allowedTools` 白名单方案，预授权 Bash/Read/Write/Edit/Glob/Grep/WebSearch/WebFetch 等工具
+- Claude 在 `--print` 模式下不再弹权限按钮，直接执行
+- 代码、写文件、跑命令全程无阻塞
+
+### v2.0 (2026-06-14) — 从 v1 重构
+- 用 aiohttp 直连官方 WebSocket 网关，移除 botpy SDK
+- 多轮对话记忆（按 user_openid，最多 200 条）
+- 安全隔离：只有 MASTER_OPENID 可操控
+- 自动心跳 + 断线重连
+
 ## 开源协议
 
 MIT
