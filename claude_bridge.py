@@ -47,7 +47,10 @@ HEARTBEAT_INTERVAL = 15.0  # 服务端33秒超时，留足余量
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.FileHandler("/root/logs/claude_bridge.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 logger = logging.getLogger("claude_bridge")
 
@@ -343,7 +346,7 @@ async def _heartbeat_sender(ws, interval: float):
 
 async def event_loop(ws):
     """WebSocket event receive loop with reconnect"""
-    global _session_id, _last_seq, _running, _ws, heartbeat_task
+    global _session_id, _last_seq, _running, _ws, heartbeat_task, _ws_session
     _ws = ws
     backoff_idx = 0
     connect_time = 0.0
