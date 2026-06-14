@@ -22,12 +22,12 @@ from typing import Optional, Dict, Any
 
 # ================= 配置区 =================
 # QQ 开放平台机器人凭证（第三个机器人：连Claude Code）
-APP_ID = "你的AppID"
-APP_SECRET = "你的AppSecret"
+APP_ID = "YOUR_APP_ID"  # 替换为你的 App ID
+APP_SECRET = "YOUR_APP_SECRET"  # 替换为你的 App Secret
 
 # 主理人标识（权限隔离用）
 # 首次运行时查看日志拿到的 openid，和 QQ 号可能不同
-MASTER_OPENID = "你的MASTER_OPENID"
+MASTER_OPENID = "YOUR_MASTER_OPENID"  # 替换为你的 openid
 
 # Claude Code 超时（秒）
 CLAUDE_TIMEOUT = 300
