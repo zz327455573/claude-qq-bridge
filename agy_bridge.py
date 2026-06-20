@@ -64,36 +64,73 @@ def clean_ansi(text: str) -> str:
     return ANSI_ESCAPE.sub('', text).strip()
 
 
-# 全局多轮会话 Session 存储（以 user_openid 为 Key）
-SESSION_STORE: dict[str, list] = {}
-MAX_HISTORY_LEN = 200  # 100轮对话限制，防爆 Token
+# 全局多轮会话持久化存储配置与逻辑（以 user_openid 为 Key）
+CONVERSATIONS_FILE = "/root/agy_user_conversations.json"
+USER_CONVERSATIONS: dict[str, str] = {}
+
+def load_user_conversations():
+    global USER_CONVERSATIONS
+    if os.path.exists(CONVERSATIONS_FILE):
+        try:
+            with open(CONVERSATIONS_FILE, "r") as f:
+                USER_CONVERSATIONS = json.load(f)
+            logger.info(f"Loaded {len(USER_CONVERSATIONS)} user conversation mappings.")
+        except Exception as e:
+            logger.error(f"Error loading user conversations: {e}")
+            USER_CONVERSATIONS = {}
+    else:
+        USER_CONVERSATIONS = {}
+
+def save_user_conversations():
+    try:
+        with open(CONVERSATIONS_FILE, "w") as f:
+            json.dump(USER_CONVERSATIONS, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving user conversations: {e}")
+
+def get_last_conversation_id() -> Optional[str]:
+    cache_file = "/root/.gemini/antigravity-cli/cache/last_conversations.json"
+    if not os.path.exists(cache_file):
+        return None
+    try:
+        with open(cache_file, "r") as f:
+            data = json.load(f)
+        cwd = os.path.abspath(os.getcwd())
+        if cwd in data:
+            return data[cwd]
+        if "/root" in data:
+            return data["/root"]
+        if list(data.values()):
+            return list(data.values())[0]
+    except Exception as e:
+        logger.error(f"Error reading last_conversations.json: {e}")
+    return None
 
 async def query_agy(user_id: str, prompt: str) -> str:
-    """调用 agy -p，带多轮会话记忆，返回清洗后的输出（async 版，不阻塞事件循环）"""
+    """调用 agy -p，通过 --conversation <id> 实现有状态续接（async 版，不阻塞事件循环）"""
     
-    # 初始化用户历史
-    if user_id not in SESSION_STORE:
-        SESSION_STORE[user_id] = []
-    
-    # /clear 指令拦截
-    if prompt.strip() in ["/clear", "/清空", "/新对话", "/new"]:
-        SESSION_STORE[user_id] = []
+    # /clear, /new, /reset, /new6 指令拦截与状态重置
+    if prompt.strip().lower() in ["/clear", "/清空", "/新对话", "/new", "/reset", "/new6"]:
+        if user_id in USER_CONVERSATIONS:
+            del USER_CONVERSATIONS[user_id]
+            save_user_conversations()
         return "🧹 记忆已清空，开始新对话！"
     
-    # 拼接历史上下文
-    history = SESSION_STORE[user_id]
-    parts = []
-    for msg in history:
-        role = "Human" if msg["role"] == "user" else "Assistant"
-        parts.append(f"{role}: {msg['content']}")
-    parts.append(f"Human: {prompt}")
-    parts.append("Assistant:")
-    final_prompt = "\n\n".join(parts)
+    # 构造 agy 运行参数，启用 --dangerously-skip-permissions 绕过确认
+    cmd = ["agy", "-p", prompt, "--dangerously-skip-permissions"]
+    
+    # 如果已存在会话 ID，则通过 --conversation 参数传入进行状态续接
+    has_existing = False
+    if user_id in USER_CONVERSATIONS:
+        cmd.extend(["--conversation", USER_CONVERSATIONS[user_id]])
+        has_existing = True
+        logger.info(f"Resuming conversation {USER_CONVERSATIONS[user_id]} for user {user_id}")
+    else:
+        logger.info(f"Starting new conversation for user {user_id}")
     
     try:
-        # 调用 agy -p 并利用 --dangerously-skip-permissions 跳过权限对话
         proc = await asyncio.create_subprocess_exec(
-            "agy", "-p", final_prompt, "--dangerously-skip-permissions",
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=os.environ,  # 保留系统环境变量（包含 HTTP 代理等设置）
@@ -122,13 +159,15 @@ async def query_agy(user_id: str, prompt: str) -> str:
         
         reply = clean_ansi(output)
         
-        # 存入历史
-        SESSION_STORE[user_id].append({"role": "user", "content": prompt})
-        SESSION_STORE[user_id].append({"role": "assistant", "content": reply})
-        
-        # 截断防暴涨
-        if len(SESSION_STORE[user_id]) > MAX_HISTORY_LEN:
-            SESSION_STORE[user_id] = SESSION_STORE[user_id][-MAX_HISTORY_LEN:]
+        # 新会话创建成功后，读取 last_conversations.json 绑定会话 ID
+        if not has_existing:
+            conv_id = get_last_conversation_id()
+            if conv_id:
+                USER_CONVERSATIONS[user_id] = conv_id
+                save_user_conversations()
+                logger.info(f"Saved new conversation ID for {user_id}: {conv_id}")
+            else:
+                logger.error(f"Failed to get conversation ID for {user_id} after running command")
         
         return reply
         
@@ -554,6 +593,9 @@ async def main():
     print(f"  AppID: {APP_ID}")
     print(f"  Master: {MASTER_OPENID}")
     print("=" * 50)
+
+    # 启动时加载持久化的用户会话映射关系
+    load_user_conversations()
 
     import httpx
     import aiohttp
