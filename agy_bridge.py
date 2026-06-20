@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-claude_bridge_v2.py — QQ 官方 WebSocket 网关直连 Claude Code
-架构: QQ官方WS网关 ↔ Python asyncio ↔ subprocess(claude --print)
+agy_bridge.py — QQ 官方 WebSocket 网关直连 AGY (Google Antigravity)
+架构: QQ官方WS网关 ↔ Python asyncio ↔ subprocess(agy -p --dangerously-skip-permissions)
 
-复用 Hermes QQBot 适配器的官方通信协议（WebSocket op码），
-但剥离所有 Hermes 依赖，独立运行。
+复用 Claude QQ Bridge 的官方通信协议（WebSocket op码），
+针对 AGY 引擎进行了专项适配，支持非交互式指令安全直接执行。
 
 依赖: pip install aiohttp httpx
-启动: python3 /root/claude_bridge.py
+启动: python3 /root/agy_bridge.py
 """
 import asyncio
 import json
@@ -21,16 +21,15 @@ import logging
 from typing import Optional, Dict, Any
 
 # ================= 配置区 =================
-# QQ 开放平台机器人凭证（第三个机器人：连Claude Code）
+# QQ 开放平台机器人凭证（可在此配置单独的机器人凭证，默认复用 Claude 相同的凭证）
 APP_ID = "你的AppID"
 APP_SECRET = "你的AppSecret"
 
-# 主理人标识（权限隔离用）
-# 首次运行时查看日志拿到的 openid，和 QQ 号可能不同
+# 主理人标识（权限隔离用，对应用户的 openid）
 MASTER_OPENID = "你的MASTER_OPENID"
 
-# Claude Code 超时（秒）
-CLAUDE_TIMEOUT = 600
+# AGY 运行超时限制（秒）
+AGY_TIMEOUT = 600
 
 # API 端点
 API_BASE = "https://api.sgroup.qq.com"
@@ -41,45 +40,36 @@ GATEWAY_URL_PATH = "/gateway"
 CONNECT_TIMEOUT = 20
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 MAX_RECONNECT_ATTEMPTS = 100
-HEARTBEAT_INTERVAL = 15.0  # 服务端33秒超时，留足余量
+HEARTBEAT_INTERVAL = 15.0  # 服务端 33 秒超时，留足余量
 # ==========================================
+
+# 创建日志目录
+os.makedirs("/root/logs", exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("/root/logs/claude_bridge.log", encoding="utf-8"),
+        logging.FileHandler("/root/logs/agy_bridge.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
-logger = logging.getLogger("claude_bridge")
+logger = logging.getLogger("agy_bridge")
 
-# ANSI 清洗
+# ANSI 颜色渲染代码清洗正则
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-
-# 全局状态
-_access_token: Optional[str] = None
-_token_expires_at: float = 0.0
-_session_id: Optional[str] = None
-_last_seq: Optional[int] = None
-_ws = None
-_http_client = None
-_running = False
-_last_msg_id: Optional[str] = None
-_ws_session = None  # 当前活动的 aiohttp.ClientSession，用于重连时关闭旧session
-heartbeat_task = None  # 心跳任务引用
 
 
 def clean_ansi(text: str) -> str:
     return ANSI_ESCAPE.sub('', text).strip()
 
 
-# 全局 Session 存储
+# 全局多轮会话 Session 存储（以 user_openid 为 Key）
 SESSION_STORE: dict[str, list] = {}
-MAX_HISTORY_LEN = 200  # 100轮对话
+MAX_HISTORY_LEN = 200  # 100轮对话限制，防爆 Token
 
-async def query_claude(user_id: str, prompt: str) -> str:
-    """调用 claude --print，带多轮会话记忆，返回清洗后的输出（async 版，不阻塞事件循环）"""
+async def query_agy(user_id: str, prompt: str) -> str:
+    """调用 agy -p，带多轮会话记忆，返回清洗后的输出（async 版，不阻塞事件循环）"""
     
     # 初始化用户历史
     if user_id not in SESSION_STORE:
@@ -101,24 +91,34 @@ async def query_claude(user_id: str, prompt: str) -> str:
     final_prompt = "\n\n".join(parts)
     
     try:
+        # 调用 agy -p 并利用 --dangerously-skip-permissions 跳过权限对话
         proc = await asyncio.create_subprocess_exec(
-            "claude", "--print", "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent,TodoRead,TodoWrite,wenda-ops:fetch_url,wenda-ops:server_audit,wenda-ops:content_creator,wenda-ops:web_search,wenda-ops:get_weather,wenda-ops:tavily_search,wenda-ops:exa_search", "--", final_prompt,
+            "agy", "-p", final_prompt, "--dangerously-skip-permissions",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "HTTPS_PROXY": "", "HTTP_PROXY": ""},
+            env=os.environ,  # 保留系统环境变量（包含 HTTP 代理等设置）
         )
+        global _active_proc
+        _active_proc = proc
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_TIMEOUT)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=AGY_TIMEOUT)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            return "[Claude timeout]"
+            return "[AGY timeout]"
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
+        finally:
+            if _active_proc == proc:
+                _active_proc = None
         
         output = stdout.decode("utf-8", errors="replace").strip()
         if not output:
             if stderr:
-                return f"[Claude error] {stderr.decode('utf-8', errors='replace').strip()[:300]}"
-            return "[Claude no output]"
+                return f"[AGY error] {stderr.decode('utf-8', errors='replace').strip()[:300]}"
+            return "[AGY no output]"
         
         reply = clean_ansi(output)
         
@@ -133,7 +133,24 @@ async def query_claude(user_id: str, prompt: str) -> str:
         return reply
         
     except Exception as e:
-        return f"[Claude error] {str(e)[:300]}"
+        return f"[AGY error] {str(e)[:300]}"
+
+
+# 全局状态变量
+_access_token: Optional[str] = None
+_token_expires_at: float = 0.0
+_session_id: Optional[str] = None
+_last_seq: Optional[int] = None
+_ws = None
+_http_client = None
+_running = False
+_last_msg_id: Optional[str] = None
+_ws_session = None  # 当前活动的 ClientSession，重连时需关闭
+heartbeat_task = None  # 心跳任务句柄
+
+# 活动任务与进程追踪，用于 /stop 强制中断
+_active_proc: Optional[asyncio.subprocess.Process] = None
+_active_task: Optional[asyncio.Task] = None
 
 
 # ================= HTTP Client =================
@@ -180,7 +197,7 @@ async def get_gateway_url() -> str:
         f"{API_BASE}{GATEWAY_URL_PATH}",
         headers={
             "Authorization": f"QQBot {token}",
-            "User-Agent": "ClaudeBridge/2.0",
+            "User-Agent": "AgyBridge/2.0",
         },
         timeout=30.0,
     )
@@ -205,8 +222,8 @@ async def send_identify(ws):
             "shard": [0, 1],
             "properties": {
                 "$os": "Linux",
-                "$browser": "claude-bridge",
-                "$device": "claude-bridge",
+                "$browser": "agy-bridge",
+                "$device": "agy-bridge",
             },
         },
     }
@@ -247,10 +264,11 @@ async def send_message_rest(user_openid: str, content: str) -> bool:
     headers = {
         "Authorization": f"QQBot {token}",
         "Content-Type": "application/json",
-        "User-Agent": "ClaudeBridge/2.0",
+        "User-Agent": "AgyBridge/2.0",
     }
     msg_seq = _next_msg_seq(user_openid)
-    # 截断时加提示
+    
+    # 消息长度限制控制
     display_content = content
     if len(content) > 4000:
         display_content = content[:3990] + "\n\n... (已截断)"
@@ -275,7 +293,7 @@ async def send_message_rest(user_openid: str, content: str) -> bool:
         return False
 
 
-# ================= 消息处理 =================
+# ================= 消息去重处理 =================
 
 _seen_messages: Dict[str, float] = {}
 
@@ -285,7 +303,7 @@ def is_duplicate(msg_id: str) -> bool:
     if msg_id in _seen_messages and now - _seen_messages[msg_id] < 300:
         return True
     _seen_messages[msg_id] = now
-    # cleanup
+    # 垃圾清理
     if len(_seen_messages) > 1000:
         for k in list(_seen_messages.keys()):
             if now - _seen_messages[k] > 600:
@@ -295,7 +313,7 @@ def is_duplicate(msg_id: str) -> bool:
 
 async def handle_c2c_message(d: dict):
     """处理 C2C_MESSAGE_CREATE"""
-    global _last_msg_id
+    global _last_msg_id, _active_proc, _active_task
 
     msg_id = str(d.get("id", ""))
     if not msg_id or is_duplicate(msg_id):
@@ -311,15 +329,51 @@ async def handle_c2c_message(d: dict):
     _last_msg_id = msg_id
     logger.info(f"[Recv] openid={user_openid}: {content[:100]}")
 
-    # 权限隔离
+    # 权限隔离，仅限主理人操控
     if user_openid != MASTER_OPENID:
         logger.info(f"[Skip] non-master openid: {user_openid}")
         return
 
-    # 调用 Claude
-    logger.info(f"[QQ -> Claude] {content}")
-    reply = await query_claude(user_openid, content)
-    logger.info(f"[Claude -> QQ] {reply[:200]}")
+    # /stop 紧急强制终止指令拦截
+    if content.strip().lower() in ["/stop", "/停止", "/kill", "杠stop", "-stop", "--stop"]:
+        logger.info("[Recv] Stop command received")
+        killed = False
+        if _active_proc and _active_proc.returncode is None:
+            try:
+                _active_proc.kill()
+                killed = True
+            except Exception as e:
+                logger.error(f"Failed to kill active process: {e}")
+        
+        if _active_task and not _active_task.done():
+            _active_task.cancel()
+            killed = True
+            
+        _active_proc = None
+        _active_task = None
+        
+        reply = "🛑 已强制停止当前正在运行的 AGY 任务！" if killed else "ℹ️ 当前没有正在运行的 AGY 任务。"
+        await send_message_rest(user_openid, reply)
+        return
+
+    # 忙碌状态排斥检查，防止同一个 workspace 被并发修改
+    if _active_proc and _active_proc.returncode is None:
+        await send_message_rest(user_openid, "⚠️ 当前已有任务正在执行中，请稍候。若需强行终止，请发送 `/stop`。")
+        return
+
+    # 调用 AGY 并转发回复
+    logger.info(f"[QQ -> AGY] {content}")
+    
+    current_task = asyncio.current_task()
+    _active_task = current_task
+    
+    try:
+        reply = await query_agy(user_openid, content)
+    finally:
+        if _active_task == current_task:
+            _active_task = None
+            
+    logger.info(f"[AGY -> QQ] {reply[:200]}")
 
     success = await send_message_rest(user_openid, reply)
     if not success:
@@ -329,7 +383,7 @@ async def handle_c2c_message(d: dict):
 # ================= 心跳发送 =================
 
 async def _heartbeat_sender(ws, interval: float):
-    """定期发送 op 1 Heartbeat，防止服务端断连"""
+    """定期发送 op 1 Heartbeat 防止超时断连"""
     try:
         while _running and ws and not ws.closed:
             await asyncio.sleep(interval)
@@ -345,7 +399,7 @@ async def _heartbeat_sender(ws, interval: float):
 # ================= 主事件循环 =================
 
 async def event_loop(ws):
-    """WebSocket event receive loop with reconnect"""
+    """WebSocket 事件监听与自动重连循环"""
     global _session_id, _last_seq, _running, _ws, heartbeat_task, _ws_session
     _ws = ws
     backoff_idx = 0
@@ -354,14 +408,14 @@ async def event_loop(ws):
     heartbeat_interval = HEARTBEAT_INTERVAL
     heartbeat_task = None
 
-    # Start heartbeat as background task
+    # 启动心跳任务
     heartbeat_task = asyncio.create_task(_heartbeat_sender(ws, heartbeat_interval))
 
     while _running:
         try:
             connect_time = time.monotonic()
 
-            # Read events
+            # 数据读取循环
             while _running and ws and not ws.closed:
                 msg = await ws.receive()
 
@@ -435,7 +489,7 @@ async def event_loop(ws):
             if not _running:
                 return
 
-            # Quick disconnect detection
+            # 断线频发防御
             duration = time.monotonic() - connect_time
             if duration < 5.0 and connect_time > 0:
                 quick_disconnect_count += 1
@@ -446,13 +500,12 @@ async def event_loop(ws):
             else:
                 quick_disconnect_count = 0
 
-            # Reconnect
+            # 避让重连
             delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
             logger.info(f"Reconnecting in {delay}s (attempt {backoff_idx + 1})")
             await asyncio.sleep(delay)
 
             try:
-                # P1-a: 关闭旧 ws_session 防止资源泄漏
                 if _ws_session and not _ws_session.closed:
                     await _ws_session.close()
                 gateway_url = await get_gateway_url()
@@ -460,13 +513,12 @@ async def event_loop(ws):
                 _ws_session = aiohttp.ClientSession(trust_env=True)
                 ws = await _ws_session.ws_connect(
                     gateway_url,
-                    headers={"User-Agent": "ClaudeBridge/2.0"},
+                    headers={"User-Agent": "AgyBridge/2.0"},
                     timeout=aiohttp.ClientWSTimeout(ws_close=CONNECT_TIMEOUT),
                 )
                 _ws = ws
                 backoff_idx = 0
                 quick_disconnect_count = 0
-                # 取消旧心跳task，等待完成（P1-b: cancel后必须await）
                 if heartbeat_task and not heartbeat_task.done():
                     heartbeat_task.cancel()
                     try:
@@ -498,7 +550,7 @@ async def main():
     global _running, _http_client, _ws_session
 
     print("=" * 50)
-    print("  Claude Code <-> QQ Bot (Official WebSocket)")
+    print("  AGY <-> QQ Bot (Official WebSocket)")
     print(f"  AppID: {APP_ID}")
     print(f"  Master: {MASTER_OPENID}")
     print("=" * 50)
@@ -509,14 +561,14 @@ async def main():
     _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
     _running = True
 
-    # Initial connect
+    # 首次连接
     gateway_url = await get_gateway_url()
     logger.info(f"Gateway URL: {gateway_url}")
 
     _ws_session = aiohttp.ClientSession(trust_env=True)
     ws = await _ws_session.ws_connect(
         gateway_url,
-        headers={"User-Agent": "ClaudeBridge/2.0"},
+        headers={"User-Agent": "AgyBridge/2.0"},
         timeout=aiohttp.ClientWSTimeout(ws_close=CONNECT_TIMEOUT),
     )
     logger.info("WebSocket connected")
