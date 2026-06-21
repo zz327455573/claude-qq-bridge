@@ -22,11 +22,11 @@ from typing import Optional, Dict, Any
 
 # ================= 配置区 =================
 # QQ 开放平台机器人凭证（可在此配置单独的机器人凭证，默认复用 Claude 相同的凭证）
-APP_ID = "1903831548"
-APP_SECRET = "lgcYVTRQPPPQSUXaeintz6DLTcmw7IUg"
+APP_ID = "你的AppID"
+APP_SECRET = "你的AppSecret"
 
 # 主理人标识（权限隔离用，对应用户的 openid）
-MASTER_OPENID = "22CEA207255FDA723AC1EB4FDA9D09EF"
+MASTER_OPENID = "你的MASTER_OPENID"
 
 # Codex 运行超时限制（秒）
 CODEX_TIMEOUT = 600
