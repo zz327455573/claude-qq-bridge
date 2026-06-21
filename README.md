@@ -67,7 +67,7 @@ AI Agent CLI (Codex / Claude Code / AGY)
 
 | 指令 | 功能 |
 |---|---|
-| `/stop` `/kill` `/停止` `杠stop` | 强杀当前 Agent 进程 |
+| `/stop` `/kill` `/停止` | 强杀当前 Agent 进程 |
 | `/clear` `/new` | 清空上下文，开启新会话 |
 
 ---
