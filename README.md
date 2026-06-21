@@ -88,8 +88,8 @@ AI Agent CLI (Codex / Claude Code / AGY)
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/zz327455573/qq-ai-bridge.git
-cd qq-ai-bridge
+git clone https://github.com/zz327455573/codex-claude-code-qq-bot.git
+cd codex-claude-code-qq-bot
 pip install aiohttp httpx
 ```
 
