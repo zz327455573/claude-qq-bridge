@@ -26,7 +26,7 @@ APP_ID = "你的AppID"
 APP_SECRET = "你的AppSecret"
 
 # 主理人标识（权限隔离用，对应用户的 openid）
-MASTER_OPENID = "你的MasterOpenID"
+MASTER_OPENID = "你的MASTER_OPENID"
 
 # AGY 运行超时限制（秒）
 AGY_TIMEOUT = 600
@@ -129,12 +129,17 @@ async def query_agy(user_id: str, prompt: str) -> str:
     else:
         logger.info(f"Starting new conversation for user {user_id}")
     
+    run_env = os.environ.copy()
+    for proxy_key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
+        if proxy_key in run_env:
+            del run_env[proxy_key]
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=os.environ,  # 保留系统环境变量（包含 HTTP 代理等设置）
+            env=run_env,  # 排除代理干扰直连本地 LiteLLM
         )
         global _active_proc
         _active_proc = proc
