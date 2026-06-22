@@ -26,7 +26,7 @@ APP_ID = "你的AppID"
 APP_SECRET = "你的AppSecret"
 
 # 主理人标识（权限隔离用，对应用户的 openid）
-MASTER_OPENID = "你的MASTER_OPENID"
+MASTER_OPENID = "你的MasterOpenID"
 
 # AGY 运行超时限制（秒）
 AGY_TIMEOUT = 600
@@ -67,6 +67,7 @@ def clean_ansi(text: str) -> str:
 # 全局多轮会话持久化存储配置与逻辑（以 user_openid 为 Key）
 CONVERSATIONS_FILE = "/root/agy_user_conversations.json"
 USER_CONVERSATIONS: dict[str, str] = {}
+GROUP_CONTEXT_CACHE: dict[str, list[str]] = {}
 
 def load_user_conversations():
     global USER_CONVERSATIONS
@@ -374,7 +375,7 @@ async def send_group_message_rest(group_openid: str, content: str, reply_to: Opt
 
 async def handle_group_message(d: dict, event_type: str):
     """处理群聊消息事件"""
-    global _last_msg_id, _active_proc, _active_task, _bot_openid
+    global _last_msg_id, _active_proc, _active_task, _bot_openid, GROUP_CONTEXT_CACHE
 
     msg_id = str(d.get("id", ""))
     logger.info(f"[Group Raw] event={event_type} msg_id={msg_id} group={d.get('group_openid')} content={d.get('content')} mentions={d.get('mentions')}")
@@ -388,6 +389,12 @@ async def handle_group_message(d: dict, event_type: str):
 
     if not group_openid or not content:
         return
+
+    # 提取并格式化发送者名称与内容，用于上下文缓存
+    sender_name = author.get("nickname") or author.get("username")
+    if not sender_name:
+        sender_name = f"user_{member_openid[-6:]}" if member_openid else "User"
+    msg_line = f"[{sender_name}] {content.strip()}"
 
     # @ 提及校验逻辑
     # GROUP_AT_MESSAGE_CREATE 必定是 @
@@ -414,6 +421,11 @@ async def handle_group_message(d: dict, event_type: str):
                     break
 
     if not is_mentioned:
+        # 未被 @ 提及的消息，存入历史上下文缓存
+        if group_openid not in GROUP_CONTEXT_CACHE:
+            GROUP_CONTEXT_CACHE[group_openid] = []
+        GROUP_CONTEXT_CACHE[group_openid].append(msg_line)
+        GROUP_CONTEXT_CACHE[group_openid] = GROUP_CONTEXT_CACHE[group_openid][-100:]
         return
 
     _last_msg_id = msg_id
@@ -422,7 +434,20 @@ async def handle_group_message(d: dict, event_type: str):
     # 权限隔离，仅限主理人操控
     if member_openid != MASTER_OPENID:
         logger.info(f"[Group Skip] non-master openid: {member_openid}")
+        # 也当成普通群聊存入上下文缓存
+        if group_openid not in GROUP_CONTEXT_CACHE:
+            GROUP_CONTEXT_CACHE[group_openid] = []
+        GROUP_CONTEXT_CACHE[group_openid].append(msg_line)
+        GROUP_CONTEXT_CACHE[group_openid] = GROUP_CONTEXT_CACHE[group_openid][-100:]
         return
+
+    # 提取积攒的群聊消息上下文并清空
+    channel_context = ""
+    if group_openid in GROUP_CONTEXT_CACHE:
+        history_lines = GROUP_CONTEXT_CACHE[group_openid]
+        if history_lines:
+            channel_context = "[Recent group chat context]\n" + "\n".join(history_lines)
+            GROUP_CONTEXT_CACHE[group_openid] = []
 
     # 正文文本清洗：去除 `<@xxxx>` 前缀
     cleaned_content = content
@@ -461,13 +486,18 @@ async def handle_group_message(d: dict, event_type: str):
         await send_group_message_rest(group_openid, "⚠️ 当前已有任务正在执行中，请稍候。若需强行终止，请发送 `/stop`。", reply_to=msg_id)
         return
 
+    # 拼装包含历史聊天的完整 context 交付给 agy 子进程
+    prompt_to_send = cleaned_content
+    if channel_context:
+        prompt_to_send = f"{channel_context}\n\n[New message]\n{cleaned_content}"
+
     logger.info(f"[QQ Group -> AGY] group={group_openid}: {cleaned_content}")
     
     current_task = asyncio.current_task()
     _active_task = current_task
     
     try:
-        reply = await query_agy(group_openid, cleaned_content)
+        reply = await query_agy(group_openid, prompt_to_send)
     finally:
         if _active_task == current_task:
             _active_task = None
