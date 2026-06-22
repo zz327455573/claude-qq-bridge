@@ -143,6 +143,29 @@ screen -r agy-bridge
 
 ---
 
+## 更新日志（Changelog）
+
+### v1.0.0 (2026-06-22)
+- **初始版本发布**：
+  - 实现基于官方 WebSocket 协议的 Codex、Claude Code、AGY 三合一 QQ 机器人接入方案。
+  - 支持私聊（C2C）环境下各 Agent 的独立运行、自动重连以及多轮会话 Session 隔离。
+  - 支持 `/stop` 紧急强杀后台 Agent 进程与 `/new` 重置会话状态。
+
+### v1.1.0 (2026-06-22)
+- **新增 AGY 群聊支持与 Mentions 过滤**：
+  - 更新 `agy_bridge.py`：使 AGY 网关支持监听并路由群聊事件（`GROUP_MESSAGE_CREATE` 与 `GROUP_AT_MESSAGE_CREATE`）。
+  - **@ Mentions 精准过滤**：通过 `is_you` 属性比对拦截，完美杜绝群聊闲聊刷屏抢答的问题。
+  - **正文文本清洗**：使用正则表达式自动剔除消息前部的 `<@ID>` 提及标签，只发送干净的文本给 Agent。
+
+### v1.2.0 (2026-06-23)
+- **实现本地群消息缓存与 Context 回填**（解决 mention 触发时的上下文断片）：
+  - 引入 `GROUP_CONTEXT_CACHE` 内存会话缓存。非 @ 消息（以及非主理人消息）将按 `[发送者] 消息正文` 格式自动被静默缓存至对应群组队列（默认上限 100 条）。
+  - 当主理人 @ 机器人时，会自动提取缓存历史合并作为 Context 前缀，再喂给 AGY 子进程，使其完全掌握之前的聊天历史。
+  - 支持群配置参数 `historyLimit` 动态调整单群缓存长度。
+  - 重构并细化了针对 Codex 与 Claude Code 的群聊升级技术指引。
+
+---
+
 ## 开源协议（License）
 
 MIT License — 自由使用、修改、分发。
