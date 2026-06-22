@@ -184,6 +184,7 @@ _ws = None
 _http_client = None
 _running = False
 _last_msg_id: Optional[str] = None
+_bot_openid: str = ""
 _ws_session = None  # 当前活动的 ClientSession，重连时需关闭
 heartbeat_task = None  # 心跳任务句柄
 
@@ -330,6 +331,152 @@ async def send_message_rest(user_openid: str, content: str) -> bool:
     except Exception as e:
         logger.error(f"Send exception: {e}")
         return False
+
+
+async def send_group_message_rest(group_openid: str, content: str, reply_to: Optional[str] = None) -> bool:
+    """通过 REST API 发送群消息（支持回复）"""
+    token = await ensure_token()
+    client = get_http_client()
+    headers = {
+        "Authorization": f"QQBot {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "AgyBridge/2.0",
+    }
+    msg_seq = _next_msg_seq(group_openid)
+    
+    display_content = content
+    if len(content) > 4000:
+        display_content = content[:3990] + "\n\n... (已截断)"
+    
+    body = {
+        "markdown": {"content": display_content},
+        "msg_type": 2,
+        "msg_seq": msg_seq,
+    }
+    if reply_to:
+        body["msg_id"] = reply_to
+        
+    try:
+        resp = await client.post(
+            f"{API_BASE}/v2/groups/{group_openid}/messages",
+            headers=headers,
+            json=body,
+            timeout=30.0,
+        )
+        if resp.status_code >= 400:
+            logger.error(f"Group send failed [{resp.status_code}]: {resp.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Group send exception: {e}")
+        return False
+
+
+async def handle_group_message(d: dict, event_type: str):
+    """处理群聊消息事件"""
+    global _last_msg_id, _active_proc, _active_task, _bot_openid
+
+    msg_id = str(d.get("id", ""))
+    logger.info(f"[Group Raw] event={event_type} msg_id={msg_id} group={d.get('group_openid')} content={d.get('content')} mentions={d.get('mentions')}")
+    if not msg_id or is_duplicate(msg_id):
+        return
+
+    group_openid = str(d.get("group_openid", ""))
+    content = str(d.get("content", "")).strip()
+    author = d.get("author") if isinstance(d.get("author"), dict) else {}
+    member_openid = str(author.get("member_openid", ""))
+
+    if not group_openid or not content:
+        return
+
+    # @ 提及校验逻辑
+    # GROUP_AT_MESSAGE_CREATE 必定是 @
+    # GROUP_MESSAGE_CREATE 需要检查 mentions 中是否包含 bot 自身的 openid
+    is_mentioned = False
+    my_openid_in_group = ""
+    
+    mentions = d.get("mentions") or []
+    for m in mentions:
+        if m.get("is_you") is True:
+            my_openid_in_group = m.get("member_openid") or m.get("id") or m.get("user_openid") or ""
+            break
+
+    if event_type == "GROUP_AT_MESSAGE_CREATE":
+        is_mentioned = True
+    elif event_type == "GROUP_MESSAGE_CREATE":
+        if my_openid_in_group:
+            is_mentioned = True
+        elif _bot_openid and mentions:
+            for m in mentions:
+                mid = m.get("member_openid") or m.get("id") or m.get("user_openid") or ""
+                if str(mid) == str(_bot_openid):
+                    is_mentioned = True
+                    break
+
+    if not is_mentioned:
+        return
+
+    _last_msg_id = msg_id
+    logger.info(f"[Group Recv] group={group_openid} member={member_openid}: {content[:100]}")
+
+    # 权限隔离，仅限主理人操控
+    if member_openid != MASTER_OPENID:
+        logger.info(f"[Group Skip] non-master openid: {member_openid}")
+        return
+
+    # 正文文本清洗：去除 `<@xxxx>` 前缀
+    cleaned_content = content
+    if my_openid_in_group:
+        cleaned_content = re.sub(rf"<@!?{my_openid_in_group}>", "", cleaned_content).strip()
+    if _bot_openid:
+        cleaned_content = re.sub(rf"<@!?{_bot_openid}>", "", cleaned_content).strip()
+    
+    if not cleaned_content:
+        return
+
+    # /stop 紧急强制终止指令拦截
+    if cleaned_content.lower() in ["/stop", "/停止", "/kill", "杠stop", "-stop", "--stop"]:
+        logger.info("[Group Recv] Stop command received in group")
+        killed = False
+        if _active_proc and _active_proc.returncode is None:
+            try:
+                _active_proc.kill()
+                killed = True
+            except Exception as e:
+                logger.error(f"Failed to kill active process: {e}")
+        
+        if _active_task and not _active_task.done():
+            _active_task.cancel()
+            killed = True
+            
+        _active_proc = None
+        _active_task = None
+        
+        reply = "🛑 已强制停止当前正在运行的 AGY 任务！" if killed else "ℹ️ 当前没有正在运行的 AGY 任务。"
+        await send_group_message_rest(group_openid, reply, reply_to=msg_id)
+        return
+
+    # 忙碌状态排斥检查，防止并发
+    if _active_proc and _active_proc.returncode is None:
+        await send_group_message_rest(group_openid, "⚠️ 当前已有任务正在执行中，请稍候。若需强行终止，请发送 `/stop`。", reply_to=msg_id)
+        return
+
+    logger.info(f"[QQ Group -> AGY] group={group_openid}: {cleaned_content}")
+    
+    current_task = asyncio.current_task()
+    _active_task = current_task
+    
+    try:
+        reply = await query_agy(group_openid, cleaned_content)
+    finally:
+        if _active_task == current_task:
+            _active_task = None
+            
+    logger.info(f"[AGY -> QQ Group] {reply[:200]}")
+
+    success = await send_group_message_rest(group_openid, reply, reply_to=msg_id)
+    if not success:
+        logger.error("Group reply send failed")
 
 
 # ================= 消息去重处理 =================
@@ -487,14 +634,21 @@ async def event_loop(ws):
 
                     # op 0 Dispatch
                     if op == 0 and t:
+                        logger.info(f"[WS Dispatch] event_type={t}")
                         if t == "READY":
                             if isinstance(d, dict):
+                                global _bot_openid
                                 _session_id = d.get("session_id")
-                                logger.info(f"READY, session_id={_session_id}")
+                                user = d.get("user") if isinstance(d.get("user"), dict) else {}
+                                _bot_openid = str(user.get("id", ""))
+                                logger.info(f"READY, session_id={_session_id}, bot_openid={_bot_openid}")
                         elif t == "RESUMED":
                             logger.info("Session resumed")
                         elif t == "C2C_MESSAGE_CREATE":
                             task = asyncio.create_task(handle_c2c_message(d))
+                            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                        elif t in {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
+                            task = asyncio.create_task(handle_group_message(d, t))
                             task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
                         else:
                             logger.debug(f"Unhandled event: {t}")
