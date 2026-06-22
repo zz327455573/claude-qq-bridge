@@ -137,6 +137,7 @@ async def query_agy(user_id: str, prompt: str) -> str:
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=run_env,  # 排除代理干扰直连本地 LiteLLM

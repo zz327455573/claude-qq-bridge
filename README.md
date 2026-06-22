@@ -164,6 +164,11 @@ screen -r agy-bridge
   - 支持群配置参数 `historyLimit` 动态调整单群缓存长度。
   - 重构并细化了针对 Codex 与 Claude Code 的群聊升级技术指引。
 
+### v1.2.1 (2026-06-23)
+- **修复 LiteLLM 直连超时与子进程卡死问题**：
+  - 自动清理 `HTTP_PROXY` 等系统环境变量，避免本地 `localhost` 请求被代理拦截超时。
+  - 为子进程增加 `stdin=asyncio.subprocess.DEVNULL` 强制重定向输入流，解决终端被 PM2 等接管时，子进程可能永久阻塞在 stdin 读取（`tty_read`）中的死锁问题。
+
 ---
 
 ## 开源协议（License）
