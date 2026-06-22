@@ -130,9 +130,10 @@ async def query_agy(user_id: str, prompt: str) -> str:
         logger.info(f"Starting new conversation for user {user_id}")
     
     run_env = os.environ.copy()
-    for proxy_key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
-        if proxy_key in run_env:
-            del run_env[proxy_key]
+    # 剥离所有 ANTIGRAVITY_ 前缀的环境变量，强制 agy 独立直连谷歌云，不尝试连接已失效的本地 IDE 端口
+    for k in list(run_env.keys()):
+        if k.startswith("ANTIGRAVITY_"):
+            del run_env[k]
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -140,7 +141,7 @@ async def query_agy(user_id: str, prompt: str) -> str:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=run_env,  # 排除代理干扰直连本地 LiteLLM
+            env=run_env,  # 保留系统代理（如 HTTP_PROXY）以正常连通官方谷歌服务
         )
         global _active_proc
         _active_proc = proc
