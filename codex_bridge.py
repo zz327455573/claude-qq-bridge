@@ -79,6 +79,12 @@ _active_proc: Optional[asyncio.subprocess.Process] = None
 _active_task: Optional[asyncio.Task] = None
 
 
+# 群聊上下文缓存（group_openid -> list of "[sender] message"）
+GROUP_CONTEXT_CACHE: Dict[str, list] = {}
+
+# 本机器人在群里的 openid（用于 @ 校验）
+_bot_openid: Optional[str] = None
+
 # 用户 thread_id 映射（user_openid -> codex thread_id）
 THREAD_MAPPING_FILE = "/root/codex_user_threads.json"
 
@@ -162,6 +168,7 @@ async def query_codex(user_id: str, prompt: str) -> str:
         global _active_proc
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "HTTPS_PROXY": "", "HTTP_PROXY": ""},
@@ -187,12 +194,14 @@ async def query_codex(user_id: str, prompt: str) -> str:
 
         # Extract new thread_id from JSON output (for first-time creation)
         new_thread_id = extract_thread_id_from_json(output)
+        logger.info(f"[Codex] thread_id check: old={thread_id} new={new_thread_id} user={user_id}")
         if new_thread_id and not thread_id:
             save_thread_id_for_user(user_id, new_thread_id)
             logger.info(f"新线程 {new_thread_id} 已保存给用户 {user_id}")
 
         # Extract final agent message from JSON
         reply = extract_reply_from_json(output)
+        logger.info(f"[Codex DEBUG] raw_output_len={len(output)} reply_len={len(reply)} reply_preview={reply[:100] if reply else 'EMPTY'}")
 
         if not reply:
             if stderr:
@@ -348,9 +357,37 @@ async def send_message_rest(user_openid: str, content: str) -> bool:
         return False
 
 
+async def send_group_message_rest(group_openid: str, content: str, reply_to: Optional[str] = None) -> bool:
+    """通过 REST API 发送群聊消息"""
+    token = await ensure_token()
+    client = get_http_client()
+    headers = {
+        "Authorization": f"QQBot {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "AgyBridge/2.0",
+    }
+    msg_seq = _next_msg_seq(group_openid)
+    display_content = content
+    if len(content) > 4000:
+        display_content = content[:3990] + "\n\n... (已截断)"
+    body = {"content": display_content, "msg_type": 0, "msg_seq": msg_seq}
+    if reply_to:
+        body["msg_id"] = reply_to
+    try:
+        resp = await client.post(f"{API_BASE}/v2/groups/{group_openid}/messages", headers=headers, json=body, timeout=30.0)
+        if resp.status_code >= 400:
+            logger.error(f"Group send failed [{resp.status_code}]: {resp.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Group send exception: {e}")
+        return False
+
+
 # ================= 消息去重处理 =================
 
 _seen_messages: Dict[str, float] = {}
+
 
 
 def is_duplicate(msg_id: str) -> bool:
@@ -364,6 +401,141 @@ def is_duplicate(msg_id: str) -> bool:
             if now - _seen_messages[k] > 600:
                 del _seen_messages[k]
     return False
+
+
+async def handle_group_message(d: dict, event_type: str):
+    """处理 GROUP_AT_MESSAGE_CREATE / GROUP_MESSAGE_CREATE"""
+    global _last_msg_id, _active_proc, _active_task, _bot_openid
+
+    msg_id = str(d.get("id", ""))
+    if not msg_id:
+        logger.info(f"[GroupEnter] NO msg_id, return")
+        return
+    if is_duplicate(msg_id):
+        logger.info(f"[GroupEnter] DUPLICATE msg_id={msg_id}, return")
+        return
+
+    group_openid = str(d.get("group_openid", ""))
+    content = str(d.get("content", "")).strip()
+    author = d.get("author") if isinstance(d.get("author"), dict) else {}
+    member_openid = str(author.get("member_openid", ""))
+
+    if not group_openid or not content:
+        logger.info(f"[GroupEnter] NO group or content, return")
+        return
+
+    sender_name = author.get("nickname") or author.get("username")
+    if not sender_name:
+        sender_name = f"user_{member_openid[-6:]}" if member_openid else "User"
+    msg_line = f"[{sender_name}] {content.strip()}"
+
+    is_mentioned = False
+    my_openid_in_group = ""
+    mentions = d.get("mentions") or []
+    for m in mentions:
+        if m.get("is_you") is True:
+            my_openid_in_group = m.get("member_openid") or m.get("id") or m.get("user_openid") or ""
+            break
+
+    if event_type == "GROUP_AT_MESSAGE_CREATE":
+        is_mentioned = True
+    elif event_type == "GROUP_MESSAGE_CREATE":
+        if my_openid_in_group:
+            is_mentioned = True
+        elif _bot_openid and mentions:
+            for m in mentions:
+                mid = m.get("member_openid") or m.get("id") or m.get("user_openid") or ""
+                if str(mid) == str(_bot_openid):
+                    is_mentioned = True
+                    break
+
+    if not is_mentioned:
+        if group_openid not in GROUP_CONTEXT_CACHE:
+            GROUP_CONTEXT_CACHE[group_openid] = []
+        GROUP_CONTEXT_CACHE[group_openid].append(msg_line)
+        GROUP_CONTEXT_CACHE[group_openid] = GROUP_CONTEXT_CACHE[group_openid][-100:]
+        return
+
+    _last_msg_id = msg_id
+    logger.info(f"[Group Recv] group={group_openid} member={member_openid}: {content[:100]}")
+
+    if member_openid != MASTER_OPENID:
+        logger.info(f"[Group Skip] non-master openid: {member_openid}")
+        if group_openid not in GROUP_CONTEXT_CACHE:
+            GROUP_CONTEXT_CACHE[group_openid] = []
+        GROUP_CONTEXT_CACHE[group_openid].append(msg_line)
+        GROUP_CONTEXT_CACHE[group_openid] = GROUP_CONTEXT_CACHE[group_openid][-100:]
+        return
+
+    cleaned_content = content
+    if my_openid_in_group:
+        cleaned_content = re.sub(rf"<@!?{my_openid_in_group}>", "", cleaned_content).strip()
+    if _bot_openid:
+        cleaned_content = re.sub(rf"<@!?{_bot_openid}>", "", cleaned_content).strip()
+
+    if not cleaned_content:
+        return
+    if cleaned_content.strip().lower() in ["/clear", "/new", "/reset", "/新对话", "/清空"]:
+        mapping = load_thread_mapping()
+        if group_openid in mapping:
+            del mapping[group_openid]
+            save_thread_mapping(mapping)
+        GROUP_CONTEXT_CACHE[group_openid] = []
+        await send_group_message_rest(group_openid, "🧹 群聊记忆已清空，开始新对话！", reply_to=msg_id)
+        return
+
+    if cleaned_content.strip().lower() in ["/stop", "/停止", "/kill", "杠stop", "-stop", "--stop"]:
+        logger.info("[Group Recv] 收到停止指令")
+        killed = False
+        if _active_proc and _active_proc.returncode is None:
+            try:
+                _active_proc.kill()
+                killed = True
+            except Exception as e:
+                logger.error(f"终止进程失败: {e}")
+        if _active_task and not _active_task.done():
+            _active_task.cancel()
+            killed = True
+        _active_proc = None
+        _active_task = None
+        reply = "🛑 已强制停止当前正在运行的 Codex 任务！" if killed else "ℹ️ 当前没有正在运行的 Codex 任务。"
+        await send_group_message_rest(group_openid, reply, reply_to=msg_id)
+        return
+
+    # 群聊不做忙碌排斥，消息排队由 asyncio 自然调度
+    # if _active_proc and _active_proc.returncode is None:
+    #     await send_group_message_rest(group_openid, "⚠️ 当前已有任务正在执行中，请稍候。若需强行终止，请发送 /stop", reply_to=msg_id)
+    #     return
+
+    # 提取暂存的历史群聊消息，合并后作为 context 前缀
+    channel_context = ""
+    if group_openid in GROUP_CONTEXT_CACHE:
+        history_lines = GROUP_CONTEXT_CACHE[group_openid]
+        if history_lines:
+            channel_context = "[Recent group chat context]\n" + "\n".join(history_lines)
+            GROUP_CONTEXT_CACHE[group_openid] = []
+
+    # 组装包含历史记忆的 Prompt
+    prompt_to_send = cleaned_content
+    if channel_context:
+        prompt_to_send = f"{channel_context}\n\n[New message]\n{cleaned_content}"
+
+    logger.info(f"[QQ Group -> Codex] group={group_openid}: {cleaned_content}")
+
+    current_task = asyncio.current_task()
+    _active_task = current_task
+
+    try:
+        reply = await query_codex(group_openid, prompt_to_send)
+    finally:
+        if _active_task == current_task:
+            _active_task = None
+
+    logger.info(f"[Codex -> QQ Group] {reply[:200]}")
+
+    success = await send_group_message_rest(group_openid, reply, reply_to=msg_id)
+    if not success:
+        logger.error("Group reply send failed")
 
 
 async def handle_c2c_message(d: dict):
@@ -506,11 +678,15 @@ async def event_loop(ws):
                         if t == "READY":
                             if isinstance(d, dict):
                                 _session_id = d.get("session_id")
-                                logger.info(f"就绪, 会话ID={_session_id}")
+                                _bot_openid = str(d.get("user", {}).get("id", ""))
+                                logger.info(f"就绪, 会话ID={_session_id}, bot_openid={_bot_openid}")
                         elif t == "RESUMED":
                             logger.info("Session resumed")
                         elif t == "C2C_MESSAGE_CREATE":
                             task = asyncio.create_task(handle_c2c_message(d))
+                            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                        elif t in ["GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"]:
+                            task = asyncio.create_task(handle_group_message(d, t))
                             task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
                         else:
                             logger.debug(f"Unhandled event: {t}")
