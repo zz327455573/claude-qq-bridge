@@ -170,6 +170,15 @@ screen -r agy-bridge
   - **剥离 IDE 临时变量**：自动清除 `ANTIGRAVITY_` 开头的所有临时环境变量（如 `ANTIGRAVITY_LS_ADDRESS`），强制 `agy` 运行在 standalone 独立直连模式，防止连接已断开的 IDE 本地开发端口导致超时卡死。
   - **防阻塞输入**：子进程增加 `stdin=asyncio.subprocess.DEVNULL` 强制重定向，彻底杜绝 PM2 等进程守护环境下子进程由于读取标准输入（`tty_read`）挂起的问题。
 
+### v1.3.0 (2026-06-23)
+- **Claude Code 桥接器群聊支持**（对齐 AGY 版本功能）：
+  - `claude_bridge.py` 全面升级：支持 `GROUP_MESSAGE_CREATE` 与 `GROUP_AT_MESSAGE_CREATE` 群聊事件监听与路由。
+  - **@ Mentions 精准过滤**：通过 `is_you` 属性比对，仅当主理人 @ 机器人时触发回复，杜绝群聊刷屏抢答。
+  - **本地群消息上下文缓存**：引入 `GROUP_CONTEXT_CACHE`，非 @ 消息静默缓存（默认 100 条），@ 触发时自动回填上下文。
+  - **@ 标签清洗**：正则自动剔除 `<@ID>` 提及标签，发送干净文本给 Claude。
+  - **忙碌锁与 /stop 指令**：同一时间仅处理一条消息，`/stop` `/kill` `/停止` 可强杀后台进程。
+  - **子进程防阻塞**：`stdin=DEVNULL` 防止 PM2 环境下 tty_read 挂起。
+
 ---
 
 ## 开源协议（License）
